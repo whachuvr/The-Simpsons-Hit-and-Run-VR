@@ -151,10 +151,10 @@ struct State
     bool seatedMode, snapTurnEnabled, csmEnabled, enhancedMaterialsEnabled, gtaoEnabled;
     bool spatialHudEnabled;
     bool developerMenusEnabled;
-    int vehicleControlMode; // 0 = stick, 1 = VR wheel, 2 = third person
+    bool vrSteeringWheelEnabled;
     int vehicleLightMode;
     bool wheelGrabbed[2];
-    float gripValue[2],wheelGrabAngle[2],wheelGrabTarget[2],wheelGrabOffset[2],wheelAngle;
+    float gripValue[2],wheelGrabAngle[2],wheelGrabOffset[2],wheelAngle;
     // Orientation snapshot at grab: rim angle + full hand rotation. While
     // held, the hand is spun only around the wheel axis by (currentAngle -
     // grabAngle) so palms do not twist relative to the rim.
@@ -167,7 +167,6 @@ struct State
     unsigned int menuAxisLock,menuAxisNeutralFrames;
     bool vrBaseHeadingValid;
     rmt::Vector vrBaseHeading;
-    bool roomscaleMovementSuspended;
     bool cullingBaseValid;
     rmt::Matrix cullingBaseCamera;
     GLuint framebuffer, layerFramebuffer, depthTexture, multiviewDepthTexture;
@@ -301,7 +300,7 @@ static void SaveVrSettings()
                      g.seatedMode?1:0,g.snapTurnEnabled?1:0,
                      g.smoothTurnSpeed,g.snapTurnAngle,g.csmEnabled?1:0,
                      g.enhancedMaterialsEnabled?1:0,g.gtaoEnabled?1:0,
-                     g.renderScale,g.refreshRate,g.vehicleControlMode,
+                     g.renderScale,g.refreshRate,g.vrSteeringWheelEnabled?1:0,
                      g.vehicleLightMode,g.spatialHudEnabled?1:0,
                      g.developerMenusEnabled?1:0);
         std::fclose(file);
@@ -380,22 +379,21 @@ static const float kVrWheelRadius     = 0.18f;
 // 160 deg makes sharp turns easier without feeling twitchy near centre.
 static const float kVrWheelMaxAngle   = 2.44346095f;
 static const float kGrabGripThreshold = 0.55f;
-static const float kRadialTolerance   = 0.08f;
+static const float kRadialTolerance   = 0.12f;
 static const float kDepthTolerance    = 0.16f;
 // Temporal smoothing kept for calm tracking; response comes from max-angle
 // and the output curve below, not from more lag.
 static const float kAngleSmooth       = 0.18f;
 // Closer to 1.0 = slower spring-back when neither hand is gripping.
 static const float kCentreReturn      = 0.94f;
-// atan2 becomes extremely sensitive near the hub. Freeze steering before an
-// inward controller movement can amplify into a large angular jump.
-static const float kMinRadial         = 0.10f;
-// Reject impossible one-frame tracking changes without affecting deliberate
-// fast steering (about 8.5 degrees per 72 Hz frame).
-static const float kMaxGrabDelta      = 0.15f;
+static const float kMinRadial         = 0.06f;  // ignore near-centre atan2 noise
 // Small deadzone so centre stays stable without eating turn authority.
 static const float kSteerOutputDeadzone = 0.025f;
-// Grip offsets are captured from the controller's actual point on the rim.
+// Fixed 9-and-3 grab slots (radians from top of rim). hand 0 = left
+// controller → left side; hand 1 = right controller → right side.
+// ±90° is symmetric about the hub for a clean swivel.
+static const float kOptimalGrabAngle  = 1.5707963f; // 90 degrees
+
 static float UnwrapDelta(float a)
 {
     while (a >  3.14159265f) a -= 6.28318531f;
@@ -422,7 +420,7 @@ static void RotateOrientAroundWheelAxis(float delta, const rmt::Matrix& in, rmt:
 static void UpdateVrSteeringWheel()
 {
     Character* player = GetCharacterManager()->GetCharacter(0);
-    const bool active = g.vrModeEnabled && g.vehicleControlMode==1
+    const bool active = g.vrModeEnabled && g.vrSteeringWheelEnabled
                         && player && player->IsInCar();
     if (!active)
     {
@@ -454,21 +452,21 @@ static void UpdateVrSteeringWheel()
 
         const bool squeezed = g.gripValue[hand] > kGrabGripThreshold;
         const float angle = std::atan2(dx, dy);
+        // Left controller → upper-left slot; right → upper-right. Same every
+        // grab so steering feel does not depend on where on the rim you squeeze.
+        const float slotOffset = (hand == 0) ? -kOptimalGrabAngle : kOptimalGrabAngle;
+
         if (!g.wheelGrabbed[hand])
         {
             if (squeezed && close)
             {
                 g.wheelGrabbed[hand] = true;
-                g.wheelGrabOffset[hand] = UnwrapDelta(angle - g.wheelAngle);
-                // Keep the real controller angle as the input baseline and
-                // render the hand at that same point on the rim.
-                g.wheelGrabAngle[hand] = angle;
-                const unsigned other = 1u - hand;
-                g.wheelGrabTarget[hand] = g.wheelGrabbed[other]
-                    ? g.wheelGrabTarget[other] : g.wheelAngle;
-                // Store the physical orientation at the actual grab angle so
-                // the hand rotates rigidly with that point on the wheel.
-                g.wheelGrabOrientAngle[hand] = angle;
+                g.wheelGrabOffset[hand] = slotOffset;
+                g.wheelGrabAngle[hand] = g.wheelAngle + slotOffset;
+                // Rigid-follow baseline is the fixed slot on the current wheel
+                // pose, not the free-hand atan2, so both hands share one
+                // consistent wheel frame.
+                g.wheelGrabOrientAngle[hand] = g.wheelAngle + slotOffset;
                 g.wheelGrabOrientRot[hand] = pose;
                 g.wheelGrabOrientRot[hand].Row(3).Set(0.0f, 0.0f, 0.0f);
             }
@@ -479,17 +477,11 @@ static void UpdateVrSteeringWheel()
         }
         else if (radial > kMinRadial)
         {
-            // Accumulate the shortest angular movement from the previous
-            // frame.  Using an absolute wrapped atan2 angle here made the
-            // target jump from one steering lock to the other whenever a hand
-            // crossed the +/-pi seam.  It also made off-slot grabs snap.
-            float delta = UnwrapDelta(angle - g.wheelGrabAngle[hand]);
-            delta = std::max(-kMaxGrabDelta, std::min(kMaxGrabDelta, delta));
-            g.wheelGrabTarget[hand] += delta;
-            g.wheelGrabTarget[hand] = std::max(-kVrWheelMaxAngle,
-                                               std::min(kVrWheelMaxAngle,
-                                                        g.wheelGrabTarget[hand]));
-            targetSum += g.wheelGrabTarget[hand];
+            // Controller orbit around the hub drives the wheel; fixed offset
+            // keeps left/right contributions aligned to the 10-and-2 slots.
+            float desired = UnwrapDelta(angle - g.wheelGrabOffset[hand]);
+            desired = std::max(-kVrWheelMaxAngle, std::min(kVrWheelMaxAngle, desired));
+            targetSum += desired;
             ++targetCount;
             g.wheelGrabAngle[hand] = angle;
         }
@@ -509,11 +501,10 @@ static void UpdateVrSteeringWheel()
     }
 }
 
-// Hide the seated character mesh only for the first-person VR vehicle modes.
-// mVisibleCharacters is only read when entering a car, so flipping that flag at
-// runtime does nothing. Instead remove the drawable from the world scene (same
-// path SetCharactersVisible(0) uses at get-in time). The original third-person
-// camera must keep the driver visible through the vehicle windows.
+// Hide the seated character mesh in VR. mVisibleCharacters is only read when
+// entering a car, so flipping that flag at runtime does nothing. Instead remove
+// the drawable from the world scene (same path SetCharactersVisible(0) uses at
+// get-in time). Bonestorm Storm seats Marge under the first-person camera.
 static void UpdateVrInCarCharacterVisibility()
 {
     Character* player = GetCharacterManager()->GetCharacter(0);
@@ -523,8 +514,7 @@ static void UpdateVrInCarCharacterVisibility()
     static bool s_playerHiddenByVr = false;
     static Character* s_hiddenNpc = NULL;
 
-    const bool hide = g.vrModeEnabled && player->IsInCar() &&
-                      g.vehicleControlMode != 2;
+    const bool hide = g.vrModeEnabled && player->IsInCar();
 
     if (hide)
     {
@@ -875,8 +865,7 @@ static void SyncInputActions()
     // (and with it the virtual wheel) while driving.
     {
         Character* drivePlayer = GetCharacterManager()->GetCharacter(0);
-        const bool blockLookStick = g.vrModeEnabled && drivePlayer && drivePlayer->IsInCar() &&
-                                    g.vehicleControlMode!=2;
+        const bool blockLookStick = g.vrModeEnabled && drivePlayer && drivePlayer->IsInCar();
         set("RightStickX", blockLookStick ? 0.0f : look.x);
         set("RightStickY", blockLookStick ? 0.0f : look.y);
     }
@@ -898,7 +887,7 @@ static void SyncInputActions()
     // one squeeze trigger both a face-button action and the grip action.
     // In wheel mode squeeze belongs exclusively to grabbing the rim. This
     // prevents the right hand from applying the handbrake while steering.
-    set("White",(!(g.vrModeEnabled && g.vehicleControlMode==1) &&
+    set("White",(!(g.vrModeEnabled && g.vrSteeringWheelEnabled) &&
                   g.gripValue[1]>0.55f)?1.0f:0.0f);
     set("LeftThumb",boolean(g.leftStickClickAction)?1.0f:0.0f);
     set("RightThumb",boolean(g.rightStickClickAction)?1.0f:0.0f);
@@ -964,21 +953,15 @@ void SetVehicleLightMode(int mode)
 int GetVehicleLightMode(){ return g.vehicleLightMode; }
 void SetVrSteeringWheelEnabled(bool enabled)
 {
-    SetVehicleControlMode(enabled?1:0);
-}
-bool IsVrSteeringWheelEnabled(){ return g.vehicleControlMode==1; }
-void SetVehicleControlMode(int mode)
-{
-    g.vehicleControlMode=std::max(0,std::min(2,mode));
+    g.vrSteeringWheelEnabled=enabled;
     g.wheelGrabbed[0]=g.wheelGrabbed[1]=false;
     g.wheelAngle=0.0f;
     SaveVrSettings();
 }
-int GetVehicleControlMode(){ return g.vehicleControlMode; }
-bool IsThirdPersonVehicleMode(){ return g.vehicleControlMode==2; }
+bool IsVrSteeringWheelEnabled(){ return g.vrSteeringWheelEnabled; }
 bool GetVrSteeringWheelValue(float* value)
 {
-    if (!value || !g.vrModeEnabled || g.vehicleControlMode!=1) return false;
+    if (!value || !g.vrModeEnabled || !g.vrSteeringWheelEnabled) return false;
 
     float t = g.wheelAngle / kVrWheelMaxAngle; // [-1, 1]
     const float sign = (t >= 0.0f) ? 1.0f : -1.0f;
@@ -1101,32 +1084,12 @@ bool ConsumeRoomscaleMovement(rmt::Vector* worldDelta)
                      g.eyes[1].view.pose.position.x)*0.5f;
     head.position.z=(g.eyes[0].view.pose.position.z+
                      g.eyes[1].view.pose.position.z)*0.5f;
-
-    Character* player=GetCharacterManager() ?
-                      GetCharacterManager()->GetCharacter(0) : NULL;
-    if(player && player->IsInCar())
-    {
-        // The vehicle camera needs the origin captured on entry to remain
-        // fixed. Advancing origin.x/z here cancels the HMD translation in
-        // GetEyeCamera, leaving only rotational tracking in the car.
-        g.roomscaleMovementSuspended=true;
-        return false;
-    }
-
-    if(g.roomscaleMovementSuspended)
-    {
-        // Discard the lean accumulated inside the vehicle. Otherwise the
-        // first on-foot frame would turn it into character locomotion.
-        g.origin.position.x=head.position.x;
-        g.origin.position.z=head.position.z;
-        g.roomscaleMovementSuspended=false;
-        return false;
-    }
-
     const XrPosef relative=RelativePose(g.origin,head);
     rmt::Vector local(relative.position.x,0.0f,-relative.position.z);
 
-    // Consume horizontal tracking motion as on-foot locomotion.
+    // Always consume horizontal tracking motion.  This prevents movement
+    // accumulated in a vehicle or during a tracking discontinuity from being
+    // applied when the player returns to walking.
     g.origin.position.x=head.position.x;
     g.origin.position.z=head.position.z;
 
@@ -1170,7 +1133,7 @@ bool Initialize()
     g.renderScale=1.0f;
     g.appliedRenderScale=1.0f;
     g.refreshRate=72.0f;
-    g.vehicleControlMode=0;
+    g.vrSteeringWheelEnabled=false;
     g.vehicleLightMode=1;
     g.spatialHudEnabled=true;
     g.developerMenusEnabled=false;
@@ -1215,7 +1178,7 @@ bool Initialize()
                                    (refreshRate==72.0f || refreshRate==90.0f || refreshRate==120.0f))
                                     g.refreshRate=refreshRate;
                                 if(std::fscanf(file,"\nvrSteeringWheel=%d",&vrSteeringWheel)==1)
-                                    g.vehicleControlMode=std::max(0,std::min(2,vrSteeringWheel));
+                                    g.vrSteeringWheelEnabled=vrSteeringWheel!=0;
                                 if(std::fscanf(file,"\nvehicleLights=%d",&vehicleLights)==1)
                                     g.vehicleLightMode=std::max(0,std::min(2,vehicleLights));
                                 if(std::fscanf(file,"\nspatialHud=%d",&spatialHud)==1)
@@ -2243,10 +2206,9 @@ static void DrawRadarPlane()
     rmt::Matrix anchor;
     Character* player=GetCharacterManager()->GetCharacter(0);
     const bool inCar=player&&player->IsInCar();
-    const bool fixedToVehicle=inCar&&!IsThirdPersonVehicleMode();
     rmt::Vector handPosition;
     rmt::Matrix handWorld;
-    if(fixedToVehicle){anchor.Identity();anchor.Row(3).Set(0.30f,kVrWheelCentre.y,0.54f);
+    if(inCar){anchor.Identity();anchor.Row(3).Set(0.30f,kVrWheelCentre.y,0.54f);
         const rmt::Matrix local=anchor;anchor.Mult(local,g.cullingBaseCamera);}
     else{if(!g.handPoseValid[1]) return;
         rmt::Matrix hand=PoseToGame(RelativePose(g.origin,g.handPoses[1]));
@@ -2255,7 +2217,7 @@ static void DrawRadarPlane()
     const rmt::Matrix eyeLocal=PoseToGame(RelativePose(g.origin,eye.view.pose));
     rmt::Matrix eyeWorld,worldToEye,anchorToEye,proj,mvp;
     eyeWorld.Mult(eyeLocal,g.cullingBaseCamera);
-    if(!fixedToVehicle){const rmt::Vector towardElbow=handWorld.Row(1)*0.10f;
+    if(!inCar){const rmt::Vector towardElbow=handWorld.Row(1)*0.10f;
         // Keep the tracked attachment point at the geometric centre of the
         // quad. An extra vertical offset made the map orbit around its lower
         // edge when the controller was rotated.
@@ -2265,7 +2227,7 @@ static void DrawRadarPlane()
     worldToEye.InvertOrtho(eyeWorld);
     anchorToEye.Mult(anchor,worldToEye); MakeProjection(eye.view.fov,0.05f,1000.0f,&proj);
     mvp.MultFull(anchorToEye,proj);
-    const float halfSize=fixedToVehicle?0.115f:0.0575f;
+    const float halfSize=inCar?0.115f:0.0575f;
     const float xy[4][2]={{-halfSize,-halfSize},{halfSize,-halfSize},
                           {-halfSize,halfSize},{halfSize,halfSize}};
     const float uv[4][2]={{g.radarUv[0],g.radarUv[1]},{g.radarUv[2],g.radarUv[1]},
@@ -2333,9 +2295,8 @@ static void DrawMissionHudPlanes()
     rmt::Matrix eyeWorld;eyeWorld.Mult(eyeLocal,g.cullingBaseCamera);
     Character* player=GetCharacterManager()->GetCharacter(0);
     const bool inCar=player&&player->IsInCar();
-    const bool fixedToVehicle=inCar&&!IsThirdPersonVehicleMode();
     rmt::Matrix base;
-    if(fixedToVehicle){base.Identity();base.Row(3)=kVrWheelCentre;
+    if(inCar){base.Identity();base.Row(3)=kVrWheelCentre;
         const rmt::Matrix local=base;base.Mult(local,g.cullingBaseCamera);}
     else{if(!g.handPoseValid[0]) return;
         const rmt::Matrix hand=PoseToGame(RelativePose(g.origin,g.handPoses[0]));
@@ -2367,7 +2328,7 @@ static void DrawMissionHudPlanes()
         {
             // Contextual action prompt: same right-hand attachment as the
             // radar, with a small gap above its upper edge.
-            if(fixedToVehicle)
+            if(inCar)
             {
                 anchor.Identity();
                 anchor.Row(3).Set(0.30f,kVrWheelCentre.y+0.15f,0.54f);
@@ -2387,7 +2348,7 @@ static void DrawMissionHudPlanes()
         }
         else if(slot==3 || slot==4)
         {
-            if(fixedToVehicle)
+            if(inCar)
             {
                 anchor.Identity();
                 anchor.Row(3).Set(-0.25f,kVrWheelCentre.y,0.54f);
@@ -2777,10 +2738,6 @@ void RenderControllerHands(tCamera* base)
     Character* controlledCharacter=GetCharacterManager()->GetCharacter(0);
     if(!controlledCharacter || !controlledCharacter->GetController() ||
        !controlledCharacter->GetController()->IsActive()) return;
-    // In third-person vehicle mode the tracked controllers remain active as
-    // spatial HUD anchors, but their character hand meshes must stay hidden
-    // beside the chase camera.
-    if(controlledCharacter->IsInCar() && IsThirdPersonVehicleMode()) return;
     SuperCamCentral* cameraCentral=GetSuperCamManager()->GetSCC(0);
     SuperCam* activeCamera=cameraCentral?cameraCentral->GetActiveSuperCam():NULL;
     if(activeCamera)
@@ -2867,7 +2824,7 @@ void RenderControllerHands(tCamera* base)
     }
 
     Character* drivingPlayer=GetCharacterManager()->GetCharacter(0);
-    const bool showWheel=g.vehicleControlMode==1 && drivingPlayer && drivingPlayer->IsInCar();
+    const bool showWheel=g.vrSteeringWheelEnabled && drivingPlayer && drivingPlayer->IsInCar();
     if(showWheel)
     {
         static tShader* wheelShader=NULL;
